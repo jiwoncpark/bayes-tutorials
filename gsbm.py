@@ -4,170 +4,173 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
+import torch.autograd.functional as AF
 
 # Device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 gaussian_sigma = 0.25
-eps = 1.e-3
+eps = 1e-3
 
 # Sampler for mixtures of two diagonal Gaussians
 def sample_mixture(batch_size, means):
     idx = torch.randint(0, len(means), (batch_size,), device=device)
     means = torch.tensor(means, dtype=torch.float32, device=device)
-    chosen = means[idx]  # (batch_size, 2)
-    return chosen + gaussian_sigma*torch.randn(batch_size, 2, device=device)  # unit diagonal covariance
+    chosen = means[idx]
+    return chosen + gaussian_sigma * torch.randn(batch_size, 2, device=device)
 
 # Drift network
 class DriftNet(nn.Module):
     def __init__(self, hidden=64):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(3, hidden),  # [t, x1, x2]
+            nn.Linear(3, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
             nn.Linear(hidden, 2)
         )
     def forward(self, t, x):
-        # t: (B,1), x: (B,2)
         inp = torch.cat([t, x], dim=1)
         return self.net(inp)
 
-# Spline-based conditional bridge params
+# Spline-based conditional bridge with JVP helper methods
 class SplineBridge(nn.Module):
-    def __init__(self, K=10, sigma=1.0):
+    def __init__(self, K=30, sigma=1.0):
         super().__init__()
         self.K = K
-        # Uniform knots in [0,1]
         self.register_buffer('t_knots', torch.linspace(0, 1, K))
-        # m(t) knots init = t_knots
-        self.m_knots = nn.Parameter(self.t_knots.clone())
-        # log(gamma) knots init = log(sigma*sqrt(t(1-t)))
-        init_g = sigma * torch.sqrt(self.t_knots * (1 - self.t_knots) + 1e-6)
+        self.m_knots    = nn.Parameter(self.t_knots.clone())
+        init_g          = sigma * torch.sqrt(self.t_knots * (1 - self.t_knots) + 1e-6)
         self.logg_knots = nn.Parameter(torch.log(init_g + 1e-6))
-        self.sigma = sigma
+        self.sigma      = sigma
 
     def interp(self, params, t):
-        # params: (K,), t: (B,1)
-        B = t.shape[0]
-        t_scaled = t.squeeze(-1) * (self.K - 1)  # (B,)
-        idx = torch.floor(t_scaled).long().clamp(0, self.K - 2)  # (B,)
-        w = (t_scaled - idx.float()).unsqueeze(-1)  # (B,1)
-        p0 = params[idx].unsqueeze(-1)            # (B,1)
-        p1 = params[idx + 1].unsqueeze(-1)        # (B,1)
-        return (1 - w) * p0 + w * p1, idx
+        B = t.size(0)
+        scaled = t.squeeze(-1) * (self.K - 1)
+        idx    = scaled.floor().long().clamp(0, self.K - 2)
+        w      = (scaled - idx.float()).unsqueeze(-1)
+        p0     = params[idx].unsqueeze(-1)
+        p1     = params[idx+1].unsqueeze(-1)
+        return (1 - w)*p0 + w*p1, idx
 
     def forward(self, t, x0, x1):
-        # Interpolate m(t) and gamma(t) using splines
-        m_t, idx = self.interp(self.m_knots, t)           # (B,1), indices
-        lg_t, _   = self.interp(self.logg_knots, t)       # (B,1)
-        g_t = torch.exp(lg_t)
-        g_t = g_t.clamp(min=eps)
-
-        # Mean interpolation: mu_t = (1 - m_t)*x0 + m_t*x1
-        mu_t = (1 - m_t) * x0 + m_t * x1                  # (B,2)
-
-        # Sample x_t on bridge
-        x_t = mu_t + g_t * torch.randn_like(mu_t)         # (B,2)
-
-        # Compute time-derivatives via piecewise constants
-        # m_dot ≈ (m_{i+1} - m_i) * (K-1)
-        m_diff = (self.m_knots[idx+1] - self.m_knots[idx]).unsqueeze(-1) * (self.K - 1)
-        # logg_dot ≈ (logg_{i+1} - logg_i) * (K-1)
-        lg_diff = (self.logg_knots[idx+1] - self.logg_knots[idx]).unsqueeze(-1) * (self.K - 1)
-        # gamma_dot = g_t * logg_dot
-        g_dot = g_t * lg_diff
-
-        # Compute conditional drift: u_cond = m_dot*(x1 - x0) + a_t*(x_t - mu_t)
-        a_t = (g_dot - self.sigma**2 / (2 * g_t)) / g_t
-        u_cond = m_diff * (x1 - x0) + a_t * (x_t - mu_t)
-
+        # Stage 1 drift-matching support
+        m_t, idx   = self.interp(self.m_knots, t)
+        lg_t, _    = self.interp(self.logg_knots, t)
+        g_t        = torch.exp(lg_t).clamp(min=eps)
+        mu_t       = (1 - m_t)*x0 + m_t*x1
+        x_t        = mu_t + g_t*torch.randn_like(mu_t)
+        # finite‐diff drift
+        m_diff      = (self.m_knots[idx+1] - self.m_knots[idx]).unsqueeze(-1)*(self.K-1)
+        lg_diff     = (self.logg_knots[idx+1] - self.logg_knots[idx]).unsqueeze(-1)*(self.K-1)
+        g_dot       = g_t * lg_diff
+        a_t         = (g_dot - 0.5*self.sigma**2/g_t)/g_t
+        u_cond      = m_diff*(x1-x0) + a_t*(x_t-mu_t)
         return x_t, mu_t, g_t, u_cond
 
-# Hyperparameters
-a = 0.0
-sigma = 0.1
-lr = 1e-4
+    def mean(self, t, x0_b, x1_b):
+        # t: (T2,), x0_b,x1_b: (B,1,2)
+        B = x0_b.size(0); T2 = t.size(0)
+        # expand t to (B*T2,1)
+        t_rep = t.view(T2,1).expand(T2,B).t().reshape(B*T2,1)
+        m_flat, _ = self.interp(self.m_knots, t_rep)
+        m_t = m_flat.view(B, T2, 1)
+        return (1-m_t)*x0_b + m_t*x1_b  # (B,T2,2)
+
+    def std(self, t):
+        # t: (T2,) or (T2,1)
+        if t.dim()==1:
+            t = t.unsqueeze(-1)   # (T2,1)
+        lg_flat, _ = self.interp(self.logg_knots, t)   # (T2,1)
+        std = torch.exp(lg_flat).clamp(min=eps)         # (T2,1)
+        return std  # (T2,1)
+
+# Vectorized state-cost
+def V(xt):
+    dist = xt.norm(dim=-1)
+    return (dist < a).float() * a
+
+# Hyperparams
+a = 10.0
+sigma = 0.25
+lr = 1e-3
 batch_size = 256
 epochs = 8000
 K = 30
 
-# Hyperparameters
-stage1_steps = 4      # max inner loop iterations
-stage1_tol   = 1e-4    # early stopping threshold on loss1
-stage2_steps = 4      # max inner loop iterations
-stage2_tol   = 1e-4    # early stopping threshold on loss2
+stage1_steps = 16
+stage1_tol   = 1e-4
+stage2_steps = 16
+stage2_tol   = 1e-4
 
-# Determine whether to use spline-based bridge
-use_spline = (a != 0.0)
-
-# Initialize bridge optimizer if needed
-if use_spline:
-    bridge = SplineBridge(K=K, sigma=sigma).to(device)
-    opt_bridge = torch.optim.Adam(bridge.parameters(), lr=lr)
-
-# Model & optimizers
-u_theta = DriftNet().to(device)
-opt_u = torch.optim.Adam(u_theta.parameters(), lr=lr)
+# Instantiate models
+u_theta   = DriftNet().to(device)
+opt_u     = torch.optim.Adam(u_theta.parameters(), lr=lr)
+bridge    = SplineBridge(K=K, sigma=sigma).to(device)
+opt_bridge= torch.optim.Adam(bridge.parameters(), lr=lr)
 
 # Training loop
 for epoch in range(epochs):
-    # Stage 1: Fit drift to current bridge approx
-    x0 = sample_mixture(batch_size, [(-1, -1), (-1, 1)])
-    x1 = sample_mixture(batch_size, [(1, -1), (1, 1)])
-    t = torch.rand(batch_size, 1, device=device) * (1 - 2*eps) + eps
+    # Stage 1: Drift matching
+    x0 = sample_mixture(batch_size, [(-1,-1),(-1,1)])
+    x1 = sample_mixture(batch_size, [(1,-1),(1,1)])
+    t  = torch.rand(batch_size,1,device=device)*(1-2*eps)+eps
 
-    # Drift matching loss: regress u_theta to u_cond
     for _ in range(stage1_steps):
-        if use_spline:
-            # Use learned spline bridge to get u_cond
-            x_t, mu_t, g_t, u_cond = bridge(t, x0, x1)
-        else:
-            # Use closed-form Brownian bridge
-            mu_t    = (1 - t) * x0 + t * x1
-            gamma_t = sigma * torch.sqrt(t * (1 - t) + 1e-6)
-            x_t     = mu_t + gamma_t * torch.randn_like(mu_t)
-            mu_dot  = x1 - x0
-            gamma_dot = sigma * (1 - 2*t) / (2 * torch.sqrt(t * (1 - t) + 1e-6))
-            a_t     = (gamma_dot - sigma**2 / (2 * gamma_t)) / gamma_t
-            u_cond  = mu_dot + a_t * (x_t - mu_t)
-
+        x_t, mu_t, g_t, u_cond = bridge(t, x0, x1)
         u_pred = u_theta(t, x_t)
-        loss1 = F.mse_loss(u_pred, u_cond)
-        opt_u.zero_grad()
-        loss1.backward()
-        opt_u.step()
-        if loss1.item() < stage1_tol:
-            break
+        loss1  = F.mse_loss(u_pred, u_cond)
+        opt_u.zero_grad(); loss1.backward(); opt_u.step()
+        if loss1.item()<stage1_tol: break
 
-    # Stage 2: Fit spline bridge on same x0, x1 until convergence
-    if use_spline:
-        for _ in range(stage2_steps):
-            t2 = torch.rand(batch_size, 1, device=device)
-            x_t2, mu_t2, g_t2, u_cond2 = bridge(t2, x0, x1)
-            V2 = torch.where((x_t2.pow(2).sum(-1) < 0.5**2),  a,  0.0).unsqueeze(-1)
-            # loss = 0.5 ||u_cond2||^2 + V2
-            loss2 = (0.5*u_cond2.pow(2).sum(dim=1, keepdim=True) + V2).mean()
+    # Stage 2: SplineOpt via JVP multi-time
+    T2 = 16
+    N2 = 4
+    t2 = torch.linspace(eps, 1-eps, T2, device=device)  # (T2,)
+    x0_b = x0.unsqueeze(1)  # (B,1,2)
+    x1_b = x1.unsqueeze(1)
 
-            opt_bridge.zero_grad()
-            loss2.backward()
-            opt_bridge.step()
+    for _ in range(stage2_steps):
+        eps_noise = torch.randn(batch_size, N2, T2, 2, device=device)
 
-            with torch.no_grad():
-                bridge.m_knots.data[0]   = 0.0
-                bridge.m_knots.data[-1]  = 1.0
-                bridge.logg_knots.data[0]  = torch.log(torch.tensor(eps))
-                bridge.logg_knots.data[-1] = torch.log(torch.tensor(eps))
+        # JVP for mean
+        t2_req = t2.requires_grad_(True)
+        mean_BT2_D, dmean_BT2_D = AF.jvp(
+            lambda tt: bridge.mean(tt, x0_b, x1_b),
+            (t2_req,), (torch.ones_like(t2_req),),
+            create_graph=True
+        )
+        # JVP for std
+        std_T2_1, dstd_T2_1 = AF.jvp(
+            lambda tt: bridge.std(tt),
+            (t2_req,), (torch.ones_like(t2_req),),
+            create_graph=True
+        )
 
-            if loss2.item() < stage2_tol:
-                break
+        # reshape and expand
+        mean_BT2_D  = mean_BT2_D.unsqueeze(1)  # (B,1,T2,2)
+        dmean_BT2_D = dmean_BT2_D.unsqueeze(1)
+        std_BT2_1   = std_T2_1.clamp(min=eps).unsqueeze(0).expand(batch_size, T2, 1).unsqueeze(1)
+        dstd_BT2_1  = dstd_T2_1.unsqueeze(0).expand(batch_size, T2, 1).unsqueeze(1)
 
-    # Logging
+        # sample MC
+        xt    = mean_BT2_D + std_BT2_1 * eps_noise  # (B,N2,T2,2)
+        a_BT2 = (dstd_BT2_1 - 0.5*sigma**2/std_BT2_1) / std_BT2_1
+
+        u_cond = dmean_BT2_D + a_BT2 * (xt - mean_BT2_D)
+
+        # compute loss
+        V2       = V(xt)                             # (B,N2,T2)
+        control  = 0.5/sigma**2 * (u_cond.pow(2).sum(-1))  # (B,N2,T2)
+        loss2    = (control + V2).mean()
+
+        opt_bridge.zero_grad(); loss2.backward(); opt_bridge.step()
+        if loss2.item()<stage2_tol: break
+
     if epoch % 400 == 0:
-        msg = f"Epoch {epoch}, loss1={loss1:.4f}"
-        if use_spline:
-            msg += f", loss2={loss2:.4f}"
-        print(msg)
+        print(f"Epoch {epoch:04d}, loss1={loss1:.4f}, loss2={loss2:.4f}")
+
+
 
 # Parameters
 N = 16      # number of test samples
