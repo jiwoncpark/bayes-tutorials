@@ -11,36 +11,12 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
+
 RNG = np.random.default_rng(0)
 
-SEQ_COL_CANDIDATES = ["seq", "sequence", "variant", "mutant", "aa_seq", "aa_sequence"]
-Y_COL_CANDIDATES = ["y", "fitness", "label", "target", "log_enrichment", "score"]
+SEQ_COL = "seq"
+Y_COL = "y"
 
-def infer_columns(df: pd.DataFrame) -> Tuple[str, str]:
-    seq_col = None
-    for c in SEQ_COL_CANDIDATES:
-        if c in df.columns:
-            seq_col = c
-            break
-    if seq_col is None:
-        for c in df.columns:
-            if df[c].dtype == object and df[c].astype(str).str.match(r"^[A-Za-z]+$").mean() > 0.5:
-                seq_col = c
-                break
-    if seq_col is None:
-        raise ValueError("Could not infer sequence column.")
-    y_col = None
-    for c in Y_COL_CANDIDATES:
-        if c in df.columns:
-            y_col = c
-            break
-    if y_col is None:
-        numeric_cols = [c for c in df.columns if np.issubdtype(df[c].dtype, np.number)]
-        if numeric_cols:
-            y_col = numeric_cols[-1]
-        else:
-            raise ValueError("Could not infer target column.")
-    return seq_col, y_col
 
 def sample_pairs(y: np.ndarray, max_pairs_per_anchor: int = 25):
     n = y.shape[0]
@@ -55,6 +31,7 @@ def sample_pairs(y: np.ndarray, max_pairs_per_anchor: int = 25):
         U.extend(js.tolist())
     return np.asarray(V, dtype=np.int64), np.asarray(U, dtype=np.int64)
 
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", type=str, required=True)
@@ -62,17 +39,28 @@ def main():
     ap.add_argument("--test_size", type=float, default=0.2)
     ap.add_argument("--val_size", type=float, default=0.1)
     ap.add_argument("--random_state", type=int, default=42)
-    ap.add_argument("--max_pairs_per_anchor", type=int, default=25)
+    ap.add_argument("--num_variable_pos", type=int, default=4)
+    ap.add_argument("--prefix_filter", type=str, default="A")
+    ap.add_argument("--max_pairs_per_anchor", type=int, default=1)
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    df = pd.read_csv(args.csv)
-    seq_col, y_col = infer_columns(df)
-    df = df[[seq_col, y_col]].dropna().drop_duplicates().reset_index(drop=True)
-    df.rename(columns={seq_col: "sequence", y_col: "y"}, inplace=True)
+    df = pd.read_csv(args.csv)  # [149361, 3]
+    df.to_csv("raw.csv", index=False)
+
+    df = df[[SEQ_COL, Y_COL]].dropna().drop_duplicates().reset_index(drop=True)
+    df.rename(columns={SEQ_COL: "sequence", Y_COL: "y"}, inplace=True)
     df = df.drop_duplicates(subset=["sequence"], keep="first").reset_index(drop=True)
+
+    # Optional filtering and truncation by num_variable_pos and prefix_filter
+    num_fixed_pos = 4 - args.num_variable_pos
+    if args.num_variable_pos is not None:
+        original_size = df.shape[0]
+        df = df[df["sequence"].str.startswith("A"*num_fixed_pos)].reset_index(drop=True)
+        df["sequence"] = df["sequence"].str[num_fixed_pos:]
+        print(f"Filtered {original_size} sequences to {df.shape[0]} sequences with {args.num_variable_pos} variable positions starting with {args.prefix_filter*num_fixed_pos}")
 
     trainval_df, test_df = train_test_split(df, test_size=args.test_size, random_state=args.random_state, shuffle=True)
     rel_val = args.val_size / (1.0 - args.test_size)
@@ -91,6 +79,8 @@ def main():
         "m_train": int(V_train.size),
         "m_val": int(V_val.size),
         "sequence_length": int(len(train_df["sequence"].iloc[0])) if len(train_df)>0 else None,
+        "num_variable_pos": args.num_variable_pos,
+        "prefix_filter": args.prefix_filter,
     }
 
     train_df.to_csv(out_dir / "train_instances.csv", index=False)
