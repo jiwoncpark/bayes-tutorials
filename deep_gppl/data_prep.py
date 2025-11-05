@@ -48,11 +48,14 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     df = pd.read_csv(args.csv)  # [149361, 3]
-    df.to_csv("raw.csv", index=False)
+    df.to_csv(os.path.join(out_dir, "raw.csv"), index=False)
 
     df = df[[SEQ_COL, Y_COL]].dropna().drop_duplicates().reset_index(drop=True)
     df.rename(columns={SEQ_COL: "sequence", Y_COL: "y"}, inplace=True)
     df = df.drop_duplicates(subset=["sequence"], keep="first").reset_index(drop=True)
+    original_size = df.shape[0]
+    df = df[df["sequence"].str.len() == 4]
+    print(f"Filtered {df.shape[0]} sequences to {df.shape[0]} sequences with length 4")
 
     # Optional filtering and truncation by num_variable_pos and prefix_filter
     num_fixed_pos = 4 - args.num_variable_pos
